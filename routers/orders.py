@@ -1,23 +1,14 @@
 from fastapi import APIRouter, HTTPException, Depends
 from database import orders_col, users_col
-from models.schemas import OrderCreate, PaymentConfirm, StatusUpdate
+from models.schemas import OrderCreate, PaymentVerify, StatusUpdate
 from utils.jwt_handler import require_customer, require_admin
 from bson import ObjectId
 from datetime import datetime
-import random, string, hmac, hashlib, os
+import random, string
 
 router = APIRouter()
 
-RAZORPAY_KEY_ID     = os.getenv("RAZORPAY_KEY_ID",     "rzp_test_YourKeyHere")
-RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "YourSecretHere")
-
-SERVICE_PRICES = {
-    "washing":      10,
-    "dry_cleaning": 30,
-    "ironing":       8,
-    "full_laundry": 25,
-}
-
+SERVICE_PRICES = {"washing": 10, "dry_cleaning": 30, "ironing": 8, "full_laundry": 25}
 SUBSCRIPTION_PLANS = {
     "basic":    {"clothes": 10, "price": 349, "label": "Basic — 10 clothes"},
     "standard": {"clothes": 20, "price": 649, "label": "Standard — 20 clothes"},
@@ -34,28 +25,23 @@ def clean(doc):
 def calc_ondemand(items):
     return sum(SERVICE_PRICES.get(i["service"], 10) * i["count"] for i in items)
 
-def verify_sig(order_id, payment_id, signature):
-    msg      = f"{order_id}|{payment_id}"
-    expected = hmac.new(RAZORPAY_KEY_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, signature)
-
-# ── ADMIN routes FIRST ────────────────────────────────────────────────────────
+# ── ADMIN routes FIRST (before wildcard) ──────────────────────────────────────
 
 @router.get("/admin/stats")
 async def admin_stats(user=Depends(require_admin)):
     total     = await orders_col.count_documents({})
-    paid      = await orders_col.count_documents({"payment_status": "paid"})
+    review    = await orders_col.count_documents({"status": "payment_review"})
     pending   = await orders_col.count_documents({"status": "payment_pending"})
     active    = await orders_col.count_documents({"status": {"$in": ["confirmed","picked_up","in_progress","ready","out_for_delivery"]}})
     delivered = await orders_col.count_documents({"status": "delivered"})
     subs      = await orders_col.count_documents({"order_type": "subscription"})
-    rev       = [r async for r in orders_col.aggregate([
+    rev = [r async for r in orders_col.aggregate([
         {"$match": {"payment_status": "paid"}},
         {"$group": {"_id": None, "t": {"$sum": "$amount"}}}
     ])]
-    return {"total": total, "paid": paid, "pending": pending, "active": active,
-            "delivered": delivered, "subscriptions": subs,
-            "revenue": rev[0]["t"] if rev else 0}
+    return {"total": total, "pending": pending, "payment_review": review,
+            "active": active, "delivered": delivered,
+            "subscriptions": subs, "revenue": rev[0]["t"] if rev else 0}
 
 @router.get("/admin/all")
 async def admin_all(user=Depends(require_admin)):
@@ -80,37 +66,72 @@ async def admin_status(data: StatusUpdate, user=Depends(require_admin)):
          "$push": {"status_history": {"status": data.status.value,
                    "note": data.note or "", "time": now.isoformat()}}}
     )
-    if res.matched_count == 0:
-        raise HTTPException(404, "Order not found")
+    if res.matched_count == 0: raise HTTPException(404, "Order not found")
     return clean(await orders_col.find_one({"_id": ObjectId(data.order_id)}))
 
-# ── CUSTOMER routes ───────────────────────────────────────────────────────────
+@router.put("/admin/verify-payment")
+async def admin_verify_payment(data: PaymentVerify, user=Depends(require_admin)):
+    """Admin approves or rejects the UPI transaction ID submitted by customer."""
+    now = datetime.utcnow()
+    if data.approved:
+        new_status     = "confirmed"
+        payment_status = "paid"
+        note = data.note or "Payment verified by admin"
+    else:
+        new_status     = "payment_pending"
+        payment_status = "pending"
+        note = data.note or "Transaction ID rejected — please re-submit correct ID"
+
+    await orders_col.update_one(
+        {"_id": ObjectId(data.order_id)},
+        {"$set": {"status": new_status, "payment_status": payment_status, "updated_at": now},
+         "$push": {"status_history": {"status": new_status, "note": note, "time": now.isoformat()}}}
+    )
+    return clean(await orders_col.find_one({"_id": ObjectId(data.order_id)}))
+
+# ── CUSTOMER routes ────────────────────────────────────────────────────────────
 
 @router.post("/")
 async def create_order(data: OrderCreate, user=Depends(require_customer)):
     for _ in range(5):
         num = gen_num()
-        if not await orders_col.find_one({"order_number": num}):
-            break
+        if not await orders_col.find_one({"order_number": num}): break
 
     now = datetime.utcnow()
+    is_cash = data.payment_method.value == "cash"
 
     if data.order_type == "subscription":
         plan = SUBSCRIPTION_PLANS.get(data.subscription_plan.value if data.subscription_plan else "basic")
-        if not plan:
-            raise HTTPException(400, "Invalid subscription plan")
-        amount        = plan["price"]
-        clothes_count = plan["clothes"]
-        service_items = []
-        services      = []
+        if not plan: raise HTTPException(400, "Invalid subscription plan")
+        amount = plan["price"]; clothes_count = plan["clothes"]
+        service_items = []; services = []
     else:
-        if not data.service_items:
-            raise HTTPException(400, "Select at least one service")
+        if not data.service_items: raise HTTPException(400, "Select at least one service")
         items         = [{"service": si.service.value, "count": si.count} for si in data.service_items]
         amount        = calc_ondemand(items)
         clothes_count = sum(si.count for si in data.service_items)
         service_items = items
         services      = list({si.service.value for si in data.service_items})
+
+    # Cash orders go straight to confirmed; UPI/card orders need admin review
+    if is_cash:
+        init_status     = "confirmed"
+        payment_status  = "cash_on_pickup"
+        init_note       = "Order confirmed. Payment to be collected on pickup."
+    else:
+        init_status     = "payment_review"
+        payment_status  = "pending"
+        init_note       = f"Payment submitted via {data.payment_method.value.replace('_',' ')}. Transaction ref: {data.upi_ref or 'N/A'}. Awaiting admin verification."
+
+    # Auto-save address for customer
+    if data.pickup_address and data.pincode:
+        cust = await users_col.find_one({"_id": ObjectId(user["user_id"])})
+        saved = cust.get("saved_addresses", []) if cust else []
+        exists = any(s["address"] == data.pickup_address and s["pincode"] == data.pincode for s in saved)
+        if not exists:
+            await users_col.update_one({"_id": ObjectId(user["user_id"])}, {
+                "$push": {"saved_addresses": {"address": data.pickup_address, "pincode": data.pincode}}
+            })
 
     order = {
         "order_number":      num,
@@ -125,89 +146,26 @@ async def create_order(data: OrderCreate, user=Depends(require_customer)):
         "pincode":           data.pincode,
         "pickup_date":       data.pickup_date,
         "pickup_time":       data.pickup_time,
-        "delivery_date":     data.delivery_date,
-        "delivery_time":     data.delivery_time,
         "amount":            amount,
-        "status":            "payment_pending",
-        "payment_status":    "pending",
-        "razorpay_order_id":   None,
-        "razorpay_payment_id": None,
-        "status_history":    [{"status": "payment_pending",
-                               "note": "Order placed, awaiting payment",
-                               "time": now.isoformat()}],
-        "created_at": now,
-        "updated_at": now,
+        "payment_method":    data.payment_method.value,
+        "upi_ref":           data.upi_ref or "",
+        "status":            init_status,
+        "payment_status":    payment_status,
+        "status_history":    [{"status": init_status, "note": init_note, "time": now.isoformat()}],
+        "created_at":        now,
+        "updated_at":        now,
     }
     res = await orders_col.insert_one(order)
     return clean(await orders_col.find_one({"_id": res.inserted_id}))
-
-@router.post("/razorpay/create")
-async def razorpay_create_order(order_id: str, user=Depends(require_customer)):
-    import razorpay
-    order = await orders_col.find_one({"_id": ObjectId(order_id), "customer_id": user["user_id"]})
-    if not order:
-        raise HTTPException(404, "Order not found")
-    if order["payment_status"] == "paid":
-        raise HTTPException(400, "Already paid")
-
-    client    = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
-    rzp_order = client.order.create({
-        "amount":   order["amount"] * 100,
-        "currency": "INR",
-        "receipt":  order["order_number"],
-        "notes":    {"ww_order_id": str(order["_id"])}
-    })
-
-    await orders_col.update_one(
-        {"_id": ObjectId(order_id)},
-        {"$set": {"razorpay_order_id": rzp_order["id"]}}
-    )
-    return {
-        "razorpay_order_id": rzp_order["id"],
-        "amount":            order["amount"] * 100,
-        "currency":          "INR",
-        "key_id":            RAZORPAY_KEY_ID,
-        "order_number":      order["order_number"],
-        "customer_name":     "",
-        "customer_phone":    "",
-    }
-
-@router.post("/razorpay/verify")
-async def razorpay_verify(data: PaymentConfirm, user=Depends(require_customer)):
-    order = await orders_col.find_one({
-        "razorpay_order_id": data.razorpay_order_id,
-        "customer_id":       user["user_id"]
-    })
-    if not order:
-        raise HTTPException(404, "Order not found")
-    if order["payment_status"] == "paid":
-        raise HTTPException(400, "Already paid")
-    if not verify_sig(data.razorpay_order_id, data.razorpay_payment_id, data.razorpay_signature):
-        raise HTTPException(400, "Payment verification failed — invalid signature")
-
-    now = datetime.utcnow()
-    await orders_col.update_one(
-        {"_id": order["_id"]},
-        {"$set": {"payment_status": "paid", "status": "confirmed",
-                  "razorpay_payment_id": data.razorpay_payment_id, "updated_at": now},
-         "$push": {"status_history": {"status": "confirmed",
-                   "note": f"Payment verified. Razorpay ID: {data.razorpay_payment_id}",
-                   "time": now.isoformat()}}}
-    )
-    return clean(await orders_col.find_one({"_id": order["_id"]}))
 
 @router.get("/my-orders")
 async def my_orders(user=Depends(require_customer)):
     return [clean(o) async for o in
             orders_col.find({"customer_id": user["user_id"]}).sort("created_at", -1)]
 
-# ── MUST be last — wildcard ───────────────────────────────────────────────────
+# wildcard LAST
 @router.get("/track/{order_number}")
 async def track(order_number: str, user=Depends(require_customer)):
-    o = await orders_col.find_one({
-        "order_number": order_number.upper(),
-        "customer_id":  user["user_id"]
-    })
-    if not o:
-        raise HTTPException(404, "Order not found")
+    o = await orders_col.find_one({"order_number": order_number.upper(), "customer_id": user["user_id"]})
+    if not o: raise HTTPException(404, "Order not found")
     return clean(o)
