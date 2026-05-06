@@ -10,7 +10,6 @@ class ServiceType(str, Enum):
 
 class OrderStatus(str, Enum):
     payment_pending    = "payment_pending"
-    payment_review     = "payment_review"   # admin reviewing txn id
     confirmed          = "confirmed"
     picked_up          = "picked_up"
     in_progress        = "in_progress"
@@ -24,10 +23,10 @@ class SubscriptionPlan(str, Enum):
     standard = "standard"
 
 class PaymentMethod(str, Enum):
-    phone_pay  = "phone_pay"
-    qr_code    = "qr_code"
-    upi        = "upi"
-    cash       = "cash"
+    phone_pay = "phone_pay"
+    gpay      = "gpay"
+    upi       = "upi"
+    cash      = "cash"
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 class CustomerRegister(BaseModel):
@@ -61,12 +60,13 @@ class OrderCreate(BaseModel):
     pickup_date: str   # "2024-04-10"
     pickup_time: str   # "08:00 AM"
     payment_method: PaymentMethod
-    upi_ref: Optional[str] = ""   # transaction id (empty for cash)
+    upi_ref: Optional[str] = ""   # unused for online; kept for cash fallback
 
-class PaymentVerify(BaseModel):
-    order_id: str
-    approved: bool
-    note: Optional[str] = ""
+class RazorpayVerify(BaseModel):
+    razorpay_order_id:  str
+    razorpay_payment_id: str
+    razorpay_signature:  str
+    order_data: OrderCreate   # full order details to persist after verification
 
 # ── Admin ─────────────────────────────────────────────────────────────────────
 class StatusUpdate(BaseModel):
