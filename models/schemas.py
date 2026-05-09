@@ -3,10 +3,10 @@ from typing import Optional, List
 from enum import Enum
 
 class ServiceType(str, Enum):
-    washing      = "washing"
-    dry_cleaning = "dry_cleaning"
-    ironing      = "ironing"
-    full_laundry = "full_laundry"
+    washing_iron  = "washing_iron"   # Washing + Iron  — ₹45
+    ironing       = "ironing"        # Only Iron       — ₹30
+    dry_wash_iron = "dry_wash_iron"  # Dry Wash + Iron — ₹90
+    bed_sheet     = "bed_sheet"      # Bed Sheet/Spread — ₹55
 
 class OrderStatus(str, Enum):
     payment_pending    = "payment_pending"

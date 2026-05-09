@@ -13,7 +13,12 @@ RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "your_razorpay_secret")
 
 rzp_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
 
-SERVICE_PRICES = {"washing": 10, "dry_cleaning": 30, "ironing": 8, "full_laundry": 25}
+SERVICE_PRICES = {
+    "washing_iron":  45,   # Washing + Iron per item
+    "ironing":       30,   # Only Iron per item
+    "dry_wash_iron": 90,   # Dry Wash + Iron per item
+    "bed_sheet":     55,   # Bed Sheet / Bed Spread per piece
+}
 SUBSCRIPTION_PLANS = {
     "basic":    {"clothes": 10, "price": 349, "label": "Basic — 10 clothes"},
     "standard": {"clothes": 20, "price": 649, "label": "Standard — 20 clothes"},
